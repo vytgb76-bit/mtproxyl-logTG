@@ -45,6 +45,47 @@ class Tests(unittest.TestCase):
         self.assertIn('handshake successful', content)
         self.assertEqual(file.name, 'VPS_NL_2026-10-31.log.gz')
 
+    def test_docker_export_command_and_stderr(self):
+        cfg = {'server_name': 'VPS_DE', 'source_kind': 'docker',
+               'source_target': 'mtproxyl', 'chat_id': '123', 'bot_token': '123:aaa'}
+        calls = []
+        class DockerProcess:
+            def __init__(self, cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                self.stdout = io.BytesIO(b'2026-10-31T01:01:02+03:00 MTProto handshake successful\n')
+            def wait(self, timeout=None):
+                return 0
+            def kill(self):
+                return None
+        with patch.object(logship.subprocess, 'Popen', DockerProcess):
+            file = logship.archive_day(cfg, dt.date(2026, 10, 31))
+        with gzip.open(file, 'rt') as fh:
+            content = fh.read()
+        self.assertIn('Source: docker / mtproxyl', content)
+        self.assertIn('handshake successful', content)
+        self.assertTrue(calls[0][0][0].endswith('/docker'))
+        self.assertIn('--since', calls[0][0])
+        self.assertIn('--until', calls[0][0])
+        self.assertEqual(calls[0][1]['stderr'], logship.subprocess.STDOUT)
+
+    def test_docker_error_keeps_no_partial_archive(self):
+        cfg = {'server_name': 'VPS_DE', 'source_kind': 'docker',
+               'source_target': 'mtproxyl', 'chat_id': '123', 'bot_token': '123:aaa'}
+        class FailedProcess:
+            def __init__(self, *args, **kwargs):
+                self.stdout = io.BytesIO(b'Error response from daemon: logging driver unsupported\n')
+            def wait(self, timeout=None):
+                return 1
+            def kill(self):
+                return None
+        with patch.object(logship.subprocess, 'Popen', FailedProcess):
+            with self.assertRaisesRegex(RuntimeError, 'Docker|docker'):
+                logship.archive_day(cfg, dt.date(2026, 10, 31))
+        self.assertEqual(list(logship.PENDING.iterdir()), [])
+
+    def test_legacy_binary_config(self):
+        self.assertEqual(logship.log_source(self.cfg), ('service', 'mtproxyl-telemt'))
+
     def test_pending_is_retained_and_resumed_after_failed_send(self):
         file = logship.PENDING / 'VPS_NL_2026-10-31.log.gz'
         file.write_bytes(b'abcdefghijklmnopqrstuvwxyz')
