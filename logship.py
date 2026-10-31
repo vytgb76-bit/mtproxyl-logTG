@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MTProxyL journal -> one Telegram bot, per-host daily archives.
 
-Requires Python >= 3.8 and systemd journalctl. Does not modify proxy service.
+Requires Python >= 3.8 and either systemd journalctl or Docker CLI. Does not modify proxy service.
 """
 import datetime as dt
 import fcntl
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,17 +56,44 @@ def atomic_json(path, obj):
 def settings():
     cfg = load_json(CONF)
     name = cfg.get('server_name', '')
-    unit = cfg.get('unit', '')
+    kind, target = log_source(cfg)
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', name):
         raise ValueError('Invalid server_name')
-    if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,100}', unit):
-        raise ValueError('Invalid systemd unit')
+    if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,100}', target):
+        raise ValueError('Invalid log source name')
     if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', cfg.get('bot_token', '')):
         raise ValueError('Invalid bot token')
     if not re.fullmatch(r'-?[0-9]+', str(cfg.get('chat_id', ''))):
         raise ValueError('Invalid chat_id')
     return cfg
 
+
+
+def log_source(cfg):
+    """Support older configs from binary-only installs without changing them."""
+    if 'source_kind' in cfg or 'source_target' in cfg:
+        kind = cfg.get('source_kind')
+        target = cfg.get('source_target')
+    else:
+        kind, target = 'service', cfg.get('unit')
+    if kind not in ('service', 'docker'):
+        raise ValueError('source_kind must be service or docker')
+    if not isinstance(target, str) or not re.fullmatch(r'[A-Za-z0-9_.@-]{1,100}', target):
+        raise ValueError('Invalid source_target/unit')
+    return kind, target
+
+
+def export_command(cfg, start, end):
+    kind, target = log_source(cfg)
+    if kind == 'service':
+        return ['/usr/bin/journalctl', '--quiet', '--no-pager',
+                '-u', target, '-o', 'short-iso-precise',
+                '--since', '@' + str(start),
+                '--until', f'@{end - 0.000001:.6f}']
+    # UTC absolute timestamps avoid ambiguity on DST transitions.
+    fmt = lambda stamp: dt.datetime.fromtimestamp(stamp, dt.timezone.utc).isoformat(timespec='seconds')
+    return [shutil.which('docker') or '/usr/bin/docker', 'logs', '--timestamps', '--since', fmt(start),
+            '--until', fmt(end), target]
 
 def next_midnight(date):
     # Uses server's local timezone, including DST changes.
@@ -80,18 +108,22 @@ def archive_day(cfg, day):
         return target
     start = next_midnight(day)
     end = next_midnight(day + dt.timedelta(days=1))
-    cmd = [
-        '/usr/bin/journalctl', '--quiet', '--no-pager',
-        '-u', cfg['unit'], '-o', 'short-iso-precise',
-        '--since', f'@{start}', '--until', f'@{end - 0.000001:.6f}',
-    ]
+    kind, source_target = log_source(cfg)
+    cmd = export_command(cfg, start, end)
     fd, tmp = tempfile.mkstemp(prefix='.archive-', dir=PENDING)
     try:
         with os.fdopen(fd, 'wb') as raw:
             with gzip.GzipFile(filename=filename[:-3], mode='wb', fileobj=raw, mtime=0) as out:
-                out.write(f'# MTProxyL daily log\n# Server: {name}\n# Unit: {cfg["unit"]}\n# Date: {day}\n# Local time: {time.strftime("%Z %z")}\n# Source: systemd journal\n\n'.encode())
+                out.write((f'# MTProxyL daily log\n# Server: {name}\n'
+                           f'# Source: {kind} / {source_target}\n# Date: {day}\n'
+                           f'# Local time: {time.strftime("%Z %z")}\n\n').encode())
                 with tempfile.TemporaryFile(mode='w+b') as errors:
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors)
+                    # Docker emits container stdout/stderr on two CLI streams.
+                    # Merge them; do not silently omit failed handshakes/errors.
+                    capture_docker = (kind == 'docker')
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                            stderr=(subprocess.STDOUT if capture_docker else errors))
+                    preview = bytearray()
                     try:
                         assert proc.stdout is not None
                         while True:
@@ -99,6 +131,8 @@ def archive_day(cfg, day):
                             if not block:
                                 break
                             out.write(block)
+                            if capture_docker and len(preview) < 512:
+                                preview.extend(block[:512-len(preview)])
                         code = proc.wait(timeout=120)
                     except BaseException:
                         proc.kill()
@@ -107,7 +141,9 @@ def archive_day(cfg, day):
                     if code != 0:
                         errors.seek(0)
                         detail = errors.read(512).decode('utf-8', errors='replace').strip()
-                        raise RuntimeError(f'journalctl failed ({code}): {detail}')
+                        if capture_docker:
+                            detail = bytes(preview).decode('utf-8', errors='replace').strip()
+                        raise RuntimeError(f'{kind} log export failed ({code}): {detail}')
             raw.flush()
             os.fsync(raw.fileno())
         os.replace(tmp, target)
@@ -205,9 +241,10 @@ def deliver_pending(cfg):
 
 
 def do_test(cfg):
+    kind, target = log_source(cfg)
     with tempfile.NamedTemporaryFile(mode='wb', dir=BASE, prefix='.test-', delete=False) as tmp:
         path = Path(tmp.name)
-        tmp.write((f'Test connection to Telegram bot\nServer: {cfg["server_name"]}\nSource unit: {cfg["unit"]}\n').encode())
+        tmp.write((f'Test connection to Telegram bot\nServer: {cfg["server_name"]}\nSource: {kind} / {target}\n').encode())
     try:
         upload(path, 0, path.stat().st_size,
                f'{cfg["server_name"]}_TEST.txt', f'Проверка логов: {cfg["server_name"]}', cfg)
@@ -223,7 +260,8 @@ def main():
     cfg = settings()
     if sys.argv[1] == 'status':
         print('Server:', cfg['server_name'])
-        print('Source: journalctl -u', cfg['unit'])
+        kind, target = log_source(cfg)
+        print('Source:', 'journalctl -u' if kind == 'service' else 'docker logs', target)
         print('Today (VPS local time):', dt.date.today())
         print('Next date to archive:', load_json(CURSOR).get('next_date'))
         print('Unsent archives:', len(list(PENDING.glob('*.log.gz'))))
